@@ -47,6 +47,7 @@ All reviewers are read-only. `docs-sync` and `test-specialist` are the only agen
 
 | Skill | Purpose |
 |---|---|
+| `review` | Runs all five quality agents (`test-specialist`, `security-auditor`, `code-reviewer`, `code-simplifier`, `architecture-reviewer`) in parallel against the current uncommitted working tree and returns one consolidated verdict. |
 | `work` | Drives the next unchecked task in `docs/projects/[project]/tasks.md` through the full plan → implement → test → review → simplify cycle. Supports `--auto` for unattended sweeps. |
 
 ### Project scaffold (`docs/projects/`)

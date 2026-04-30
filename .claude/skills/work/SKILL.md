@@ -10,7 +10,7 @@ Pick the next pending task from a project's task list and drive it through the f
 
 If no argument is given, list all projects in `docs/projects/` and ask the user which one to work on.
 
-**`--auto` (unattended mode)**: skips all user-interaction gates so one invocation sweeps the entire task list end-to-end. Specifically: step 2 skips the "confirm before proceeding" gate, Phase 1 skips Plan Mode entirely (still does exploration and writes the plan to the turn output for the transcript record, but does not call `EnterPlanMode`/`ExitPlanMode` since those require human approval), step 17 creates one git commit per completed task (using the release-notes agent to draft the message) without pausing for approval, and step 18 auto-continues to the next unchecked task without asking. Hard stops (step 2 empty list, step 11 BLOCK verdict, step 12 tests failing twice, step 17 commit still failing after one retry, step 18 empty list) still terminate the run — those are error/completion exits, not checkpoints.
+**`--auto` (unattended mode)**: skips all user-interaction gates so one invocation sweeps the entire task list end-to-end. Specifically: step 2 skips the "confirm before proceeding" gate, Phase 1 skips Plan Mode entirely (still does exploration and writes the plan to the turn output for the transcript record, but does not call `EnterPlanMode`/`ExitPlanMode` since those require human approval), step 15 creates one git commit per completed task (using the release-notes agent to draft the message) without pausing for approval, and step 16 auto-continues to the next unchecked task without asking. Hard stops (step 2 empty list, step 9 caused-by-diff failures unresolved, step 11 BLOCK verdict, step 12 tests failing twice, step 15 commit still failing after one retry, step 16 empty list) still terminate the run — those are error/completion exits, not checkpoints.
 
 Because `--auto` commits everything in the working tree at the end of each task, start from a clean working tree (no unrelated uncommitted changes). If `git status` is dirty at step 2 in `--auto` mode, stop and report to the user instead of sweeping those changes into a task commit.
 
@@ -33,7 +33,7 @@ Read `docs/projects/[project]/tasks.md`. Find the first unchecked task (`- [ ]`)
 
 - If no unchecked tasks remain, tell the user all tasks are complete and stop.
 - Announce which task you're picking up.
-- **With `--auto`**: run `git status --porcelain` first. If the working tree is not clean, stop and report the dirty files to the user — do not proceed, because step 17 would otherwise sweep those unrelated changes into the task commit. Then proceed immediately.
+- **With `--auto`**: run `git status --porcelain` first. If the working tree is not clean, stop and report the dirty files to the user — do not proceed, because step 15 would otherwise sweep those unrelated changes into the task commit. Then proceed immediately.
 - **Without `--auto`**: confirm with the user before proceeding. A dirty working tree is fine here since the user commits manually.
 
 ---
@@ -108,17 +108,38 @@ Use the `Agent` tool with `subagent_type: "test-specialist"` to write and run te
 Write tests for the changes just implemented for the [task name] task
 in project [project]. The following files were changed: [list changed files].
 If test infrastructure is not yet configured, set it up using the project's
-idiomatic framework. Run all tests and fix any failures. Focus on the test
-scenarios from the test plan that relate to this task.
+idiomatic framework. Focus on the test scenarios from the test plan that
+relate to this task.
+
+Run the full test suite. Never weaken assertions to make a failing test
+pass. If a test you wrote still fails after 2 fix attempts, leave it
+failing — it's a real signal. Do not modify pre-existing/unrelated tests.
+
+For each remaining failure, give:
+- file:line of the failing assertion
+- one-line cause
+- attribution: tag "caused-by-diff" UNLESS you can clearly articulate
+  why this would have been failing on HEAD before the diff was applied.
+  On uncertainty, default to "caused-by-diff": a false "pre-existing"
+  tag means the user ships a regression unflagged.
+
+Return:
+- PASS or FAIL with counts (N passing, M failing)
+- New test files or infra created (paths, or "none")
+- Remaining failures with attribution tags (or "none")
 ```
 
-Wait for the agent to finish and confirm all tests pass before proceeding.
+Wait for the agent to finish, then gate on attribution:
 
-### 10. Review — Conditional, Parallel
+- If any failure is tagged `caused-by-diff`, stop and report — the task isn't ready for review. With `--auto` this is a hard stop; without `--auto` ask the user how to proceed.
+- Pre-existing failures are surfaced in the final report (step 16) but do not block.
+- If the agent returns `UNAVAILABLE` (timeout, runtime failure, missing definition), stop and report — do not run reviewers against unverified code.
 
-Run `git diff HEAD --name-only` to get the list of changed files, then launch the applicable reviewers in parallel:
+### 10. Review Panel — Parallel
 
-**Always run code-reviewer** (every change needs bug/security review):
+Run `git diff HEAD --name-only` to get the list of changed files, then launch the applicable reviewers. **All `Agent` calls in this step MUST be issued in a single assistant turn** so the harness runs them concurrently.
+
+**Always run code-reviewer:**
 
 Use the `Agent` tool with `subagent_type: "code-reviewer"`:
 
@@ -126,9 +147,13 @@ Use the `Agent` tool with `subagent_type: "code-reviewer"`:
 Review the changes made for the [task name] task. The following files were
 changed: [list changed files]. Check for bugs, security issues, type-safety
 violations, and project convention violations per CLAUDE.md.
+
+Use your standard review checklist and output format. Use your native
+severity vocabulary (ERROR / WARNING / SUGGESTION) and verdict line
+(PASS / PASS_WITH_WARNINGS / BLOCK).
 ```
 
-**Always run security-auditor** (every change needs security & exposure review):
+**Always run security-auditor:**
 
 Use the `Agent` tool with `subagent_type: "security-auditor"`:
 
@@ -137,11 +162,30 @@ Audit the changes made for the [task name] task. The following files were
 changed: [list changed files]. Check for hardcoded secrets, personal-info
 exposure, sensitive content leaks, path traversal risks, unsanitized input
 in shell commands, and anything unsafe to commit to the remote.
+
+Use your standard audit checklist and output format. Use your native
+severity vocabulary (CRITICAL / WARNING / NOTE) and verdict line
+(PASS / PASS_WITH_WARNINGS / BLOCK).
 ```
 
-**Run architecture-reviewer when applicable:**
+**Always run code-simplifier:**
 
-Use the `Agent` tool with `subagent_type: "architecture-reviewer"` **if** the task involves new modules, changes to centralized wrappers (config, logger, external-CLI/process spawning, I/O helpers), new background/scheduled work, changes to process startup/shutdown, new agent definitions, or changes that cross module boundaries.
+Use the `Agent` tool with `subagent_type: "code-simplifier"`:
+
+```
+Check the changes made for the [task name] task for dead code,
+over-abstractions, duplication, and unnecessary complexity. Read CLAUDE.md
+for intentional patterns and the project's abstraction philosophy.
+
+Use your standard output format with Quick Wins / Medium Effort /
+Structural sections. This is advisory — do NOT emit a verdict line.
+```
+
+> **Why simplifier runs in the panel rather than as a sequential step:** simplifier sees pre-fix code, but most of its findings are about the user's diff (which exists regardless of reviewer fixes). Running it in parallel saves one test round and matches `/review`'s structure. Findings that fix-step changes obviate get filtered out at apply time in step 11.
+
+**Run architecture-reviewer when applicable** — if the task involves new modules, changes to centralized wrappers (config, logger, external-CLI/process spawning, I/O helpers), new background/scheduled work, changes to process startup/shutdown, new agent definitions, or changes that cross module boundaries. Otherwise skip it.
+
+Use the `Agent` tool with `subagent_type: "architecture-reviewer"`:
 
 ```
 Review the changes made for the [task name] task. The following files were
@@ -149,63 +193,63 @@ changed: [list changed files]. Check for module boundary violations,
 resource lifecycle issues, centralization violations, graceful shutdown
 gaps, concurrency hazards, and any project-specific architectural rules
 in CLAUDE.md.
+
+Use your standard checklist and output format. Use your native
+severity vocabulary (BLOCK / WARNING / SUGGESTION) and verdict line
+(PASS / PASS_WITH_WARNINGS / BLOCK).
 ```
 
-If a reviewer is not applicable, skip it and note "N/A — no relevant changes" in the completion summary.
+If a reviewer is skipped (architecture-reviewer only) or returns `UNAVAILABLE` (timeout, runtime failure, unparseable response), note it in the completion summary with a one-line reason and proceed with the remaining reviewers' findings. Do not retry.
 
-### 11. Fix Review Issues
+### 11. Normalize, Fix, and Apply Simplifier Findings
 
-Collect findings from all reviewers. Address issues in priority order:
+Collect findings from all reviewers and normalize into a unified BLOCK / WARN / INFO taxonomy:
 
-1. **Critical / BLOCK / ERROR** — fix all of these, no exceptions
-2. **Warnings** — fix unless there's a clear reason to skip (explain why if skipping)
-3. **Suggestions** — apply easy wins (< 5 min effort); skip the rest
+| Source signal | Maps to |
+|---|---|
+| security-auditor `CRITICAL` | **BLOCK** |
+| code-reviewer `ERROR` | **BLOCK** |
+| architecture-reviewer `BLOCK` | **BLOCK** |
+| any agent `WARNING` | **WARN** |
+| code-reviewer `SUGGESTION` | **INFO** |
+| security-auditor `NOTE` | **INFO** |
+| architecture-reviewer `SUGGESTION` | **INFO** |
+| simplifier `Quick Win` | **INFO** (apply by default) |
+| simplifier `Medium Effort` / `Structural` | listed separately; not normalized |
+| any agent `UNAVAILABLE` | noted in summary; contributes no findings |
 
-If no issues were found, skip to step 12.
+> **Why findings drive the verdict, not per-agent verdict lines:** an agent's verdict line is informational. What matters for gating is the normalized severity of its findings — that avoids double-counting and conflicts (e.g., agent emits `verdict: BLOCK` but no `BLOCK`-severity findings).
 
-If any reviewer returns a BLOCK verdict, or fixing issues requires fundamentally changing the approach, stop and report to the user with blocking findings and a proposed alternative. Do NOT proceed until the user confirms.
+**Dedupe**: if two or more reviewers flag substantively the same concern at the same `file:line` (or `file` if no line is given), list once and tag with all agent names: `[code-reviewer + security-auditor]`. Pick the most severe normalized severity across the duplicates. "Substantively the same" means same root cause; different concerns at the same location stay separate.
 
-### 12. Test — Round 2
+Address findings in priority order:
+
+1. **BLOCK** — fix all. If a BLOCK requires fundamentally changing the approach, stop and report to the user with the proposed alternative. Do NOT proceed without confirmation.
+2. **WARN** — fix unless there's a clear reason to skip (explain why if skipping).
+3. **INFO** (non-simplifier) — apply easy wins (< 5 min effort); skip the rest.
+4. **Simplifier findings**:
+   - Quick Wins — apply all, except any obviated by your BLOCK/WARN fixes
+   - Medium Effort — apply if clearly beneficial
+   - Structural — do NOT apply; mention to the user for future consideration
+
+If no findings need addressing (no BLOCKs/WARNs/applicable INFOs and no Quick Wins to apply), skip to step 13.
+
+### 12. Test — Round 2 (Final)
 
 Use the `Agent` tool with `subagent_type: "test-specialist"`:
 
 ```
-Run all tests to verify the review fixes for [task name] didn't break
-anything. The following files were changed: [list changed files].
-Fix any failures.
+Run all tests to verify the fixes and simplifier-applied changes for
+[task name] didn't break anything. The following files were changed:
+[list changed files]. Fix any failures, using the same attribution
+discipline as round 1 (caused-by-diff vs pre-existing).
 ```
 
-Skip this step if no code changes were made in step 11.
+Skip this step if step 11 made no code changes.
 
 If tests fail after two fix attempts, stop and report the failures to the user. Do not loop indefinitely.
 
-### 13. Simplify
-
-Use the `Agent` tool with `subagent_type: "code-simplifier"`:
-
-```
-Check the changes made for the [task name] task for dead code,
-over-abstractions, duplication, and unnecessary complexity.
-```
-
-The code-simplifier is read-only — it reports findings but cannot edit files. After it finishes, apply its recommendations yourself:
-
-- **Quick Wins** — apply all
-- **Medium Effort** — apply if clearly beneficial
-- **Structural Changes** — do NOT apply; mention them to the user for future consideration
-
-### 14. Test — Round 3
-
-Use the `Agent` tool with `subagent_type: "test-specialist"` one final time:
-
-```
-Final test run after simplification for [task name]. The following files
-were changed: [list changed files]. Run all tests and fix any failures.
-```
-
-Skip this step if step 13 made no code changes.
-
-### 15. Sync Docs
+### 13. Sync Docs
 
 Use the `Agent` tool with `subagent_type: "docs-sync"`:
 
@@ -217,11 +261,11 @@ and skills tables, environment variables, and scripts.
 
 Skip this step if the task only changed existing file internals without adding new modules, commands, agents, config values, or scripts.
 
-### 16. Mark Task Done
+### 14. Mark Task Done
 
-Mark the task done in the project's `tasks.md` by changing `- [ ]` to `- [x]` for the completed task. This applies in both modes, and it happens **before** step 17 so the tasks.md update lands in the same commit as the task's code changes.
+Mark the task done in the project's `tasks.md` by changing `- [ ]` to `- [x]` for the completed task. This applies in both modes, and it happens **before** step 15 so the tasks.md update lands in the same commit as the task's code changes.
 
-### 17. Commit (`--auto` only)
+### 15. Commit (`--auto` only)
 
 **Without `--auto`**: Skip this step. The user will review the diff and commit manually.
 
@@ -251,7 +295,7 @@ Mark the task done in the project's `tasks.md` by changing `- [ ]` to `- [x]` fo
 4. Run `git status` to verify the commit landed and the tree is clean.
 5. If the commit fails (pre-commit hook, signing issue, etc.), diagnose the failure, fix the underlying issue, re-stage with `git add -A`, and create a **new** commit with the same message — do not use `--amend` or `--no-verify`. If the retry also fails, stop and report to the user with the hook output; do not loop.
 
-### 18. Report and Continue
+### 16. Report and Continue
 
 Output a completion summary:
 
@@ -269,16 +313,21 @@ Output a completion summary:
 
 - Tests written: [N]
 - Tests passing: [all/N of M]
+- Pre-existing failures (not caused by this task): [list with file:line, or "none"]
+- Test runner status: [ran successfully / UNAVAILABLE — re-run manually before committing]
 
 ### Review Summary
 
-- Code: [PASS or N issues found, N fixed]
-- Security: [PASS or N issues found, N fixed]
-- Architecture: [PASS or N/A or N issues found, N fixed]
+- BLOCK findings: [N fixed, or "none"]
+- WARN findings: [N fixed / N skipped with reason, or "none"]
+- INFO findings: [N applied / N skipped, or "none"]
+- Per-agent: code-reviewer [PASS / WARN / BLOCK / UNAVAILABLE], security-auditor [...], architecture-reviewer [PASS / N/A / UNAVAILABLE], simplifier (advisory)
 
 ### Simplification
 
-- [changes applied or "No changes needed"]
+- Quick Wins applied: [N or "none"]
+- Medium Effort applied: [N or "none"]
+- Structural (deferred for user): [list, or "none"]
 
 ### Commit
 
